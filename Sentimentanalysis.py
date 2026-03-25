@@ -64,6 +64,22 @@ where Z ~ N(0, I_d) and s = sqrt(chi²(2*nu)).  The sqrt(2*nu) factor
 is essential: it ensures omega ~ Student-t_{2nu}(0, (2nu/ell²)·I), which
 is the spectral density of the Matérn kernel (R&W 2006, §4.2).
 
+News Ingestion via NewsAPI
+--------------------------
+Headlines are fetched from newsapi.org using NewsAPIFetcher, which
+returns a list of SentimentSamples (embeddings not yet filled):
+
+    fetcher = NewsAPIFetcher(api_key="YOUR_KEY")
+    samples = fetcher.fetch("Apple earnings", from_date=date(2024,1,1))
+
+Or use the end-to-end convenience wrapper (fetch + FinBERT embed):
+
+    samples = fetch_and_embed("Apple earnings", api_key="YOUR_KEY")
+
+A free NewsAPI key (up to 100 articles/request, last 30 days) is
+available at https://newsapi.org/register.  Set NEWSAPI_KEY in your
+environment or pass it directly.
+
 Daily Calendar-Time Ingestion
 ------------------------------
 The feature space operates on DAILY granularity (calendar time).
@@ -120,6 +136,7 @@ Fixes applied (v2)
    and used automatically by fit_optimized(), closing the optimisation loop.
 """
 
+import os
 import numpy as np
 from datetime import date
 from collections import defaultdict
@@ -400,6 +417,259 @@ def embed_texts(texts: List[str],
     encoder = FinBERTEncoder(model_name=model_name, device=device,
                              batch_size=batch_size)
     samples = [SentimentSample(t) for t in texts]
+    return encoder.embed_samples(samples)
+
+
+# =============================================================================
+# NewsAPI Fetcher
+# =============================================================================
+
+class NewsAPIFetcher:
+    """
+    Fetch financial headlines from newsapi.org and return SentimentSamples
+    ready for FinBERT embedding.
+
+    Parameters
+    ----------
+    api_key : str
+        NewsAPI.org API key.  Get a free key at https://newsapi.org/register.
+        The free tier supports up to 100 articles per request and covers
+        the last 30 days.  If omitted, falls back to the NEWSAPI_KEY
+        environment variable.
+    page_size : int
+        Articles per page (max 100).  Default 100.
+    language : str
+        Article language filter (default "en").
+
+    Notes
+    -----
+    Each article is composed into a single text string:
+
+        "[<source>] <title>. <description>"
+
+    This gives FinBERT enough context (source credibility + headline +
+    lead sentence) without exceeding the 128-token truncation window.
+
+    Articles with no parseable publication date are flagged but NOT dropped
+    here — that is the caller's / fetch_and_embed()'s responsibility so that
+    DailySentimentAggregator can always validate its inputs.
+    """
+
+    BASE_URL = "https://newsapi.org/v2/everything"
+
+    def __init__(self, api_key: Optional[str] = None,
+                 page_size: int = 100,
+                 language: str = "en"):
+        resolved = api_key or os.environ.get("NEWSAPI_KEY", "")
+        if not resolved:
+            raise ValueError(
+                "NewsAPIFetcher requires an API key.  Pass api_key= or set "
+                "the NEWSAPI_KEY environment variable.  "
+                "Get a free key at https://newsapi.org/register."
+            )
+        self.api_key = resolved
+        self.page_size = min(int(page_size), 100)   # API hard cap
+        self.language = language
+
+    def fetch(self,
+              query: str,
+              from_date: Optional[date] = None,
+              to_date: Optional[date] = None,
+              max_pages: int = 1) -> List[SentimentSample]:
+        """
+        Fetch headlines matching `query` and return SentimentSamples
+        WITHOUT embeddings (call FinBERTEncoder.embed_samples() next).
+
+        Parameters
+        ----------
+        query : str
+            Search query, e.g. ``"Apple earnings"`` or
+            ``"Federal Reserve interest rate"``.
+        from_date : datetime.date, optional
+            Earliest article date.  NewsAPI free tier: last 30 days only.
+        to_date : datetime.date, optional
+            Latest article date.  Defaults to today (server-side).
+        max_pages : int
+            Pages to retrieve (each page = page_size articles).  Default 1.
+
+        Returns
+        -------
+        samples : list of SentimentSample
+            ``.text``      — ``"[Source] Title. Description"``
+            ``.timestamp`` — publication date as ``datetime.date``, or
+                             ``None`` if unparseable (filtered by
+                             ``fetch_and_embed`` / aggregator).
+            ``.embedding`` — ``None`` (fill with
+                             ``FinBERTEncoder.embed_samples()``).
+
+        Raises
+        ------
+        RuntimeError
+            If the API returns a non-200 HTTP status or an error payload.
+        ImportError
+            If the ``requests`` package is not installed.
+        """
+        try:
+            import requests as _requests
+        except ImportError as e:
+            raise ImportError(
+                "The 'requests' package is required for NewsAPIFetcher.\n"
+                "Install with: pip install requests\n"
+                f"Original error: {e}"
+            )
+
+        params: Dict[str, Any] = {
+            "q":        query,
+            "language": self.language,
+            "sortBy":   "publishedAt",
+            "pageSize": self.page_size,
+            "apiKey":   self.api_key,
+        }
+        if from_date is not None:
+            params["from"] = from_date.isoformat()
+        if to_date is not None:
+            params["to"] = to_date.isoformat()
+
+        samples: List[SentimentSample] = []
+        for page in range(1, max_pages + 1):
+            params["page"] = page
+            response = _requests.get(self.BASE_URL, params=params, timeout=15)
+
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"NewsAPI request failed (HTTP {response.status_code}): "
+                    f"{response.text[:300]}"
+                )
+
+            payload = response.json()
+            if payload.get("status") != "ok":
+                raise RuntimeError(
+                    f"NewsAPI error: {payload.get('message', payload)}"
+                )
+
+            articles = payload.get("articles", [])
+            if not articles:
+                break   # exhausted
+
+            for article in articles:
+                source = (article.get("source") or {}).get("name") or ""
+                title  = (article.get("title")       or "").strip()
+                desc   = (article.get("description") or "").strip()
+
+                # Skip placeholder / removed articles (NewsAPI artefact)
+                if title in ("[Removed]", "") and not desc:
+                    continue
+
+                # Build a single rich-text string for FinBERT
+                parts = []
+                if source:
+                    parts.append(f"[{source}]")
+                if title:
+                    parts.append(title)
+                if desc and desc != title:
+                    parts.append(desc)
+                text = " ".join(parts)
+
+                # Parse ISO 8601 timestamp → datetime.date
+                # NewsAPI format: "2024-01-15T10:30:00Z"
+                published_at = article.get("publishedAt") or ""
+                try:
+                    pub_date: Optional[date] = date.fromisoformat(
+                        published_at[:10]
+                    )
+                except (ValueError, TypeError):
+                    pub_date = None   # DailySentimentAggregator will reject
+
+                samples.append(SentimentSample(text=text, timestamp=pub_date))
+
+        return samples
+
+    def __repr__(self):
+        return (f"NewsAPIFetcher(page_size={self.page_size}, "
+                f"language={self.language!r})")
+
+
+def fetch_and_embed(
+    query: str,
+    api_key: Optional[str] = None,
+    from_date: Optional[date] = None,
+    to_date: Optional[date] = None,
+    max_pages: int = 1,
+    drop_no_date: bool = True,
+    model_name: str = FinBERTEncoder.DEFAULT_MODEL,
+    device: Optional[str] = None,
+    batch_size: int = 32,
+) -> List[SentimentSample]:
+    """
+    End-to-end pipeline: fetch headlines from NewsAPI and embed with FinBERT.
+
+    This is the primary entry point for live sentiment ingestion.  The
+    returned samples feed directly into ``DailySentimentAggregator`` and
+    then into the ``SentimentLayer``.
+
+    Parameters
+    ----------
+    query : str
+        NewsAPI search query (e.g. ``"S&P 500"`` or ``"Apple earnings"``).
+    api_key : str, optional
+        NewsAPI.org API key.  Falls back to ``NEWSAPI_KEY`` env variable.
+    from_date : datetime.date, optional
+        Earliest article date.
+    to_date : datetime.date, optional
+        Latest article date.
+    max_pages : int
+        Pages to retrieve from NewsAPI (default 1 → up to 100 articles).
+    drop_no_date : bool
+        If True (default), silently discard articles with no parseable
+        publication date before embedding.  Set False to keep them (they
+        will then fail inside ``DailySentimentAggregator``).
+    model_name : str
+        HuggingFace FinBERT model identifier.
+    device : str or None
+        Torch device string.  Auto-detected if None.
+    batch_size : int
+        FinBERT tokenisation batch size.
+
+    Returns
+    -------
+    samples : list of SentimentSample
+        Each sample has ``.text``, ``.timestamp``, and ``.embedding`` (768-d)
+        filled.  Pass to ``DailySentimentAggregator().aggregate(samples)``
+        to get one ``DailySentimentSample`` per calendar date.
+
+    Example
+    -------
+    >>> from datetime import date, timedelta
+    >>> samples = fetch_and_embed(
+    ...     "Federal Reserve interest rate",
+    ...     api_key="YOUR_KEY",
+    ...     from_date=date.today() - timedelta(days=7),
+    ... )
+    >>> agg = DailySentimentAggregator()
+    >>> daily = agg.aggregate(samples)
+    >>> layer = create_sentiment_layer(mode="aspect")
+    >>> K = layer.gram_matrix(daily)
+    """
+    fetcher = NewsAPIFetcher(api_key=api_key)
+    samples = fetcher.fetch(query, from_date=from_date, to_date=to_date,
+                            max_pages=max_pages)
+
+    if drop_no_date:
+        n_before = len(samples)
+        samples = [s for s in samples if s.timestamp is not None]
+        n_dropped = n_before - len(samples)
+        if n_dropped:
+            print(f"[fetch_and_embed] Dropped {n_dropped} article(s) with "
+                  "no parseable publication date.")
+
+    if not samples:
+        raise ValueError(
+            "No usable articles returned from NewsAPI for the given "
+            "query / date range.  Check your query, date window, and API key."
+        )
+
+    encoder = FinBERTEncoder(model_name=model_name, device=device,
+                             batch_size=batch_size)
     return encoder.embed_samples(samples)
 
 
@@ -1290,7 +1560,111 @@ def _demo_with_random_embeddings():
     print("\nSmoke test passed.")
 
 
+def _demo_live(api_key: Optional[str] = None,
+               query: str = "Federal Reserve interest rate earnings",
+               days_back: int = 7):
+    """
+    Live smoke test that pulls real headlines from NewsAPI, embeds them
+    with FinBERT, aggregates to daily samples, and runs the SentimentLayer.
+
+    Usage
+    -----
+        python Sentimentanalysis.py --live
+        NEWSAPI_KEY=your_key python Sentimentanalysis.py --live
+        python Sentimentanalysis.py --live --query "Apple earnings" --days 14
+
+    The NEWSAPI_KEY environment variable (or api_key param) must be set.
+    Get a free key at https://newsapi.org/register.
+    """
+    from datetime import timedelta
+
+    resolved_key = api_key or os.environ.get("NEWSAPI_KEY", "")
+    if not resolved_key:
+        print(
+            "[_demo_live] ERROR: No API key found.\n"
+            "  Set NEWSAPI_KEY=<your_key> in your environment, or pass api_key=.\n"
+            "  Get a free key at https://newsapi.org/register.\n"
+            "  Falling back to random-embedding demo.\n"
+        )
+        _demo_with_random_embeddings()
+        return
+
+    print("=" * 60)
+    print("SentimentLayer — live demo (NewsAPI + FinBERT)")
+    print("=" * 60)
+    print(f"Query    : {query!r}")
+    print(f"Days back: {days_back}")
+
+    from_date = date.today() - timedelta(days=days_back)
+
+    # ------------------------------------------------------------------ #
+    # 1. Fetch + embed
+    # ------------------------------------------------------------------ #
+    print(f"\nFetching headlines from NewsAPI (from {from_date})...")
+    try:
+        samples = fetch_and_embed(
+            query=query,
+            api_key=resolved_key,
+            from_date=from_date,
+            max_pages=1,          # ~100 articles; increase for longer windows
+        )
+    except Exception as exc:
+        print(f"[_demo_live] Fetch/embed failed: {exc}")
+        return
+
+    print(f"Fetched & embedded : {len(samples)} articles")
+
+    # ------------------------------------------------------------------ #
+    # 2. Daily aggregation
+    # ------------------------------------------------------------------ #
+    agg = DailySentimentAggregator()
+    daily = agg.aggregate(samples)
+    print(f"Daily aggregates   : {len(daily)} calendar days")
+    for ds in daily:
+        print(f"  {ds}")
+
+    if len(daily) < 2:
+        print("\nNeed at least 2 daily samples for kernel/PSD checks. "
+              "Widen the date range or broaden the query.")
+        return
+
+    # ------------------------------------------------------------------ #
+    # 3. SentimentLayer (aspect mode)
+    # ------------------------------------------------------------------ #
+    print("\n--- Aspect mode ---")
+    layer = create_sentiment_layer(mode="aspect", n_rff=256)
+    K = layer.gram_matrix(daily)
+    print(f"Gram matrix shape : {K.shape}")
+    print(f"Gram matrix range : [{K.min():.4f}, {K.max():.4f}]")
+
+    is_psd, min_eig = layer.is_psd(daily)
+    print(f"PSD check         : {is_psd}  (min eigenvalue = {min_eig:.2e})")
+
+    # Synthetic returns as regression target (replace with real returns)
+    rng  = np.random.RandomState(0)
+    y    = rng.randn(len(daily))
+    layer.fit(daily, y)
+    preds = layer.predict(daily)
+    print(f"Predictions shape : {preds.shape}")
+    print(f"First 5 preds     : {preds[:5].round(4)}")
+
+    print("\nLive demo completed successfully.")
+
+
 if __name__ == "__main__":
     import sys
-    if "--demo" in sys.argv or len(sys.argv) == 1:
+    args = sys.argv[1:]
+
+    if "--live" in args:
+        # Optional: --query "..." and --days N
+        query = "Federal Reserve interest rate earnings"
+        days  = 7
+        if "--query" in args:
+            qi = args.index("--query")
+            query = args[qi + 1]
+        if "--days" in args:
+            di = args.index("--days")
+            days = int(args[di + 1])
+        _demo_live(query=query, days_back=days)
+    elif "--demo" in args or not args:
         _demo_with_random_embeddings()
